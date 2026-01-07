@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
@@ -44,6 +45,7 @@ from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
 from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
+import plyfile
 
 
 def resize_image(image: torch.Tensor, d: int):
@@ -79,6 +81,46 @@ def get_viewmat(optimized_camera_to_world):
     viewmat[:, :3, :3] = R_inv
     viewmat[:, :3, 3:4] = T_inv
     return viewmat
+
+def load_gaussian_ply(ply_path, sh_degree):
+    plydata = plyfile.PlyData.read(ply_path)
+
+    data = plydata['vertex'].data
+
+    means = torch.tensor(np.vstack([data['x'], data['y'], data['z']]).T, dtype=torch.float32)
+
+    scales = torch.tensor(np.vstack([
+        data['scale_0'],
+        data['scale_1'],
+        data['scale_2']
+    ]).T, dtype=torch.float32)
+
+    # quaternion, if present
+    if 'rot_0' in data.dtype.names:
+        quats = torch.tensor(np.vstack([
+            data['rot_0'], data['rot_1'], data['rot_2'], data['rot_3']
+        ]).T, dtype=torch.float32)
+    else:
+        quats = random_quat_tensor(means.shape[0])
+
+    # SH features
+    dim_sh = num_sh_bases(sh_degree)
+    shs = torch.zeros((means.shape[0], dim_sh, 3), dtype=torch.float32)
+    shs[:, 0, :] = torch.tensor(np.vstack([data['f_dc_0'], data['f_dc_1'], data['f_dc_2']]).T)
+
+    # remaining SH
+    for i in range(1, dim_sh):
+        for c, color in enumerate(["r", "g", "b"]):
+            key = f"f_rest_{(i-1)*3 + c}"
+            if key in data.dtype.names:
+                shs[:, i, c] = torch.tensor(data[key])
+
+    features_dc = shs[:, 0, :]
+    features_rest = shs[:, 1:, :]
+
+    opacity = torch.tensor(data["opacity"]).reshape(-1, 1)
+
+    return means, scales, quats, features_dc, features_rest, opacity
 
 
 @dataclass
@@ -124,6 +166,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Number of gaussians to initialize if random init is used"""
     random_scale: float = 10.0
     "Size of the cube to initialize random gaussians within"
+    gaussian_init_ply: Optional[str] = None
+    """PLY file path to initialize gaussians from"""
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
     stop_split_at: int = 15000
@@ -187,48 +231,64 @@ class SplatfactoModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
-        if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
-        else:
-            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
-        distances, _ = k_nearest_sklearn(means.data, 3)
-        # find the average of the three nearest neighbors for each point and use that as the scale
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
-        num_points = means.shape[0]
-        quats = torch.nn.Parameter(random_quat_tensor(num_points))
-        dim_sh = num_sh_bases(self.config.sh_degree)
+        if self.config.gaussian_init_ply is not None and not self.config.random_init:
+            means, scales, quats, features_dc, features_rest, opacities = load_gaussian_ply(
+                self.config.gaussian_init_ply, self.config.sh_degree
+            )
 
-        if (
-            self.seed_points is not None
-            and not self.config.random_init
-            # We can have colors without points.
-            and self.seed_points[1].shape[0] > 0
-        ):
-            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
-            if self.config.sh_degree > 0:
-                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
-                shs[:, 1:, 3:] = 0.0
+            self.gauss_params = torch.nn.ParameterDict(
+                {
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "features_dc": features_dc,
+                    "features_rest": features_rest,
+                    "opacities": opacities,
+                }
+            )
+        else:
+            if self.seed_points is not None and not self.config.random_init:
+                means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
             else:
-                CONSOLE.log("use color only optimization with sigmoid activation")
-                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
-            features_rest = torch.nn.Parameter(shs[:, 1:, :])
-        else:
-            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+                means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+            distances, _ = k_nearest_sklearn(means.data, 3)
+            # find the average of the three nearest neighbors for each point and use that as the scale
+            avg_dist = distances.mean(dim=-1, keepdim=True)
+            scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
+            num_points = means.shape[0]
+            quats = torch.nn.Parameter(random_quat_tensor(num_points))
+            dim_sh = num_sh_bases(self.config.sh_degree)
 
-        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
-        self.gauss_params = torch.nn.ParameterDict(
-            {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
-            }
-        )
+            if (
+                self.seed_points is not None
+                and not self.config.random_init
+                # We can have colors without points.
+                and self.seed_points[1].shape[0] > 0
+            ):
+                shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
+                if self.config.sh_degree > 0:
+                    shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
+                    shs[:, 1:, 3:] = 0.0
+                else:
+                    CONSOLE.log("use color only optimization with sigmoid activation")
+                    shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
+                features_dc = torch.nn.Parameter(shs[:, 0, :])
+                features_rest = torch.nn.Parameter(shs[:, 1:, :])
+            else:
+                features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
+                features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+
+            opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+            self.gauss_params = torch.nn.ParameterDict(
+                {
+                    "means": means,
+                    "scales": scales,
+                    "quats": quats,
+                    "features_dc": features_dc,
+                    "features_rest": features_rest,
+                    "opacities": opacities,
+                }
+            )
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"

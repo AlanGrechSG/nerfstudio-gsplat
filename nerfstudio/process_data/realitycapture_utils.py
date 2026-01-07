@@ -108,6 +108,10 @@ def realitycapture_to_json(
     with open(output_dir / "transforms.json", "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
+    out_image_filename_map = {original: str(copied) for original, copied in image_filename_map.items()}
+    with open(output_dir / "original_to_ns.json", "w", encoding="utf-8") as f:
+        json.dump(out_image_filename_map, f, indent=4)
+
     summary = []
     if missing_image_data > 0:
         summary.append(f"Missing image data for {missing_image_data} cameras.")

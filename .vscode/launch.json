@@ -39,6 +39,33 @@
       ]
     },
     {
+      "name": "Python: train splatfacto on existing",
+      "type": "python",
+      "request": "launch",
+      "program": "nerfstudio/scripts/train.py",
+      "console": "integratedTerminal",
+      "args": [
+        "splatfacto",
+        "--data",
+        "D:\\st-johns_test-data\\chapel-06-germany\\processed_2",
+        "--start-paused",
+        "True",
+        "--pipeline.model.gaussian-init-ply",
+        "D:\\st-johns_test-data\\chapel-06-germany\\exports\\splat_000.ply",
+        "--pipeline.datamanager.cache-images",
+        "cpu",
+        "nerfstudio-data",
+        "--downscale-factor",
+        "4",
+        "--orientation-method",
+        "none",
+        "--center-method",
+        "none",
+        "--auto-scale-poses",
+        "False"
+      ]
+    },
+    {
       "name": "Python: train ngp",
       "type": "python",
       "request": "launch",

@@ -14,6 +14,7 @@
 
 """Helper utils for processing data into the nerfstudio format."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import random
 import re
@@ -25,6 +26,8 @@ from typing import List, Literal, Optional, OrderedDict, Tuple, Union, cast
 
 import cv2
 import imageio
+from tqdm import tqdm
+from PIL import Image
 
 try:
     import rawpy
@@ -241,6 +244,7 @@ def copy_images_list(
     upscale_factor: Optional[int] = None,
     nearest_neighbor: bool = False,
     same_dimensions: bool = True,
+    start_downscales: int = 0
 ) -> List[Path]:
     """Copy all images in a list of Paths. Useful for filtering from a directory.
     Args:
@@ -261,15 +265,14 @@ def copy_images_list(
     if image_dir.is_dir() and len(image_paths) and not keep_image_dir:
         # check that output directory is not the same as input directory
         if image_dir != image_paths[0].parent:
-            for i in range(num_downscales + 1):
+            for i in range(start_downscales, num_downscales + 1):
                 dir_to_remove = image_dir if i == 0 else f"{image_dir}_{2**i}"
                 shutil.rmtree(dir_to_remove, ignore_errors=True)
     image_dir.mkdir(exist_ok=True, parents=True)
 
     copied_image_paths = []
 
-    # Images should be 1-indexed for the rest of the pipeline.
-    for idx, image_path in enumerate(image_paths):
+    def copy_image(idx, image_path):
         if verbose:
             CONSOLE.log(f"Copying image {idx + 1} of {len(image_paths)}...")
         copied_image_path = image_dir / f"{image_prefix}{idx + 1:05d}{image_path.suffix}"
@@ -292,55 +295,179 @@ def copy_images_list(
                 run_command(ffmpeg_cmd, verbose=verbose)
         except shutil.SameFileError:
             pass
-        copied_image_paths.append(copied_image_path)
+
+        return copied_image_path
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(copy_image, idx, image_path) for idx, image_path in enumerate(image_paths)]
+        for future in tqdm(as_completed(futures), "Copying images", total=len(futures), unit="image"):
+            copied_image_paths.append(future.result())
+
+    # Images should be 1-indexed for the rest of the pipeline.
+    # for idx, image_path in enumerate(image_paths):
+    #     if verbose:
+    #         CONSOLE.log(f"Copying image {idx + 1} of {len(image_paths)}...")
+    #     copied_image_path = image_dir / f"{image_prefix}{idx + 1:05d}{image_path.suffix}"
+    #     try:
+    #         # if CR2 raw, we want to read raw and write RAW_CONVERTED_SUFFIX, and change the file suffix for downstream processing
+    #         if image_path.suffix.lower() in ALLOWED_RAW_EXTS:
+    #             copied_image_path = image_dir / f"{image_prefix}{idx + 1:05d}{RAW_CONVERTED_SUFFIX}"
+    #             with rawpy.imread(str(image_path)) as raw:
+    #                 rgb = raw.postprocess()
+    #             imageio.imsave(copied_image_path, rgb)
+    #             image_paths[idx] = copied_image_path
+    #         elif same_dimensions:
+    #             # Fast path; just copy the file
+    #             shutil.copy(image_path, copied_image_path)
+    #         else:
+    #             # Slow path; let ffmpeg perform autorotation (and clear metadata)
+    #             ffmpeg_cmd = f"ffmpeg -y -i {image_path} -metadata:s:v:0 rotate=0 {copied_image_path}"
+    #             if verbose:
+    #                 CONSOLE.log(f"... {ffmpeg_cmd}")
+    #             run_command(ffmpeg_cmd, verbose=verbose)
+    #     except shutil.SameFileError:
+    #         pass
+    #     copied_image_paths.append(copied_image_path)
 
     nn_flag = "" if not nearest_neighbor else ":flags=neighbor"
-    downscale_chains = [f"[t{i}]scale=iw/{2**i}:ih/{2**i}{nn_flag}[out{i}]" for i in range(num_downscales + 1)]
-    downscale_dirs = [Path(str(image_dir) + (f"_{2**i}" if i > 0 else "")) for i in range(num_downscales + 1)]
+    # Levels we want (e.g., start_downscales=2 → [2,3,4,...])
+    levels = list(range(start_downscales, num_downscales + 1))
+    num_levels = len(levels)
+
+    # Create downscale directories matching levels
+    downscale_dirs = [
+        Path(str(image_dir) + (f"_{2**level}" if level > 0 else ""))
+        for level in levels
+    ]
 
     for dir in downscale_dirs:
         dir.mkdir(parents=True, exist_ok=True)
 
+    # Build filter graph using contiguous numbering t0,t1,... and out0,out1,...
+    downscale_chains = []
+    for idx, level in enumerate(levels):
+        scale = 2 ** level
+        downscale_chains.append(
+            f"[t{idx}]scale=iw/{scale}:ih/{scale}{nn_flag}[out{idx}]"
+        )
+
+    # One split feeds N downscale branches
     downscale_chain = (
-        f"split={num_downscales + 1}"
-        + "".join([f"[t{i}]" for i in range(num_downscales + 1)])
-        + ";"
-        + ";".join(downscale_chains)
+        f"split={num_levels}" +
+        "".join([f"[t{i}]" for i in range(num_levels)]) +
+        ";" +
+        ";".join(downscale_chains)
     )
 
     num_frames = len(image_paths)
     # ffmpeg batch commands assume all images are the same dimensions.
     # When this is not the case (e.g. mixed portrait and landscape images), we need to do individually.
     # (Unfortunately, that is much slower.)
-    for framenum in range(1, (1 if same_dimensions else num_frames) + 1):
-        framename = f"{image_prefix}%05d" if same_dimensions else f"{image_prefix}{framenum:05d}"
-        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{image_dir / f"{framename}{copied_image_paths[0].suffix}"}" '
+    # TODO: Uncomment
 
+    def copy_downscale_ffmpeg(framenum: int):
+        framename = f"{image_prefix}%05d" if same_dimensions else f"{image_prefix}{framenum:05d}"
+        input_file = image_dir / f"{framename}{copied_image_paths[0].suffix}"
+
+        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{input_file}" '
+
+        # Optional cropping logic
         crop_cmd = ""
         if crop_border_pixels is not None:
-            crop_cmd = f"crop=iw-{crop_border_pixels * 2}:ih-{crop_border_pixels * 2}[cropped];[cropped]"
+            crop_cmd = (
+                f"crop=iw-{crop_border_pixels * 2}:ih-{crop_border_pixels * 2}"
+                "[cropped];[cropped]"
+            )
         elif crop_factor != (0.0, 0.0, 0.0, 0.0):
             height = 1 - crop_factor[0] - crop_factor[1]
             width = 1 - crop_factor[2] - crop_factor[3]
             start_x = crop_factor[2]
             start_y = crop_factor[0]
-            crop_cmd = f"crop=w=iw*{width}:h=ih*{height}:x=iw*{start_x}:y=ih*{start_y}[cropped];[cropped]"
+            crop_cmd = (
+                f"crop=w=iw*{width}:h=ih*{height}:x=iw*{start_x}:y=ih*{start_y}"
+                "[cropped];[cropped]"
+            )
 
+        # Optional upscale
         select_cmd = "[0:v]"
         if upscale_factor is not None:
-            select_cmd = f"[0:v]scale=iw*{upscale_factor}:ih*{upscale_factor}:flags=neighbor[upscaled];[upscaled]"
+            select_cmd = (
+                f"[0:v]scale=iw*{upscale_factor}:ih*{upscale_factor}:flags=neighbor"
+                "[upscaled];[upscaled]"
+            )
 
-        downscale_cmd = f' -filter_complex "{select_cmd}{crop_cmd}{downscale_chain}"' + "".join(
-            [
-                f' -map "[out{i}]" -q:v 2 "{downscale_dirs[i] / f"{framename}{copied_image_paths[0].suffix}"}"'
-                for i in range(num_downscales + 1)
-            ]
+        # Build output mapping (must match contiguous indices)
+        map_cmds = "".join(
+            f' -map "[out{idx}]" -q:v 2 "{downscale_dirs[idx] / f"{framename}{copied_image_paths[0].suffix}"}"'
+            for idx in range(num_levels)
         )
 
-        ffmpeg_cmd += downscale_cmd
+        ffmpeg_cmd += f' -filter_complex "{select_cmd}{crop_cmd}{downscale_chain}"{map_cmds}'
+
         if verbose:
             CONSOLE.log(f"... {ffmpeg_cmd}")
+
         run_command(ffmpeg_cmd, verbose=verbose)
+
+    def copy_downscale(framenum: int):
+        framename = f"{image_prefix}{framenum:05d}"
+        input_file = image_dir / f"{framename}{copied_image_paths[0].suffix}"
+
+        img = Image.open(input_file)
+        for level, out_dir in zip(levels, downscale_dirs):
+            downscale = 2 ** level
+            new_size = (img.width // downscale, img.height // downscale)
+            img_resized = img.resize(new_size, Image.Resampling.LANCZOS)
+            img_resized.save(out_dir / f"{framename}{copied_image_paths[0].suffix}")
+
+    with ThreadPoolExecutor(max_workers=48) as executor:
+        # futures = [executor.submit(copy_downscale, framenum) for framenum in range(1, (1 if same_dimensions else num_frames) + 1)]
+        futures = [executor.submit(copy_downscale, framenum) for framenum in range(1, num_frames + 1)]
+        for future in tqdm(as_completed(futures), "Downscaling images", total=len(futures), unit="image"):
+            future.result()
+    # for framenum in range(1, (1 if same_dimensions else num_frames) + 1):
+    #     framename = f"{image_prefix}%05d" if same_dimensions else f"{image_prefix}{framenum:05d}"
+    #     input_file = image_dir / f"{framename}{copied_image_paths[0].suffix}"
+
+    #     ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{input_file}" '
+
+    #     # Optional cropping logic
+    #     crop_cmd = ""
+    #     if crop_border_pixels is not None:
+    #         crop_cmd = (
+    #             f"crop=iw-{crop_border_pixels * 2}:ih-{crop_border_pixels * 2}"
+    #             "[cropped];[cropped]"
+    #         )
+    #     elif crop_factor != (0.0, 0.0, 0.0, 0.0):
+    #         height = 1 - crop_factor[0] - crop_factor[1]
+    #         width = 1 - crop_factor[2] - crop_factor[3]
+    #         start_x = crop_factor[2]
+    #         start_y = crop_factor[0]
+    #         crop_cmd = (
+    #             f"crop=w=iw*{width}:h=ih*{height}:x=iw*{start_x}:y=ih*{start_y}"
+    #             "[cropped];[cropped]"
+    #         )
+
+    #     # Optional upscale
+    #     select_cmd = "[0:v]"
+    #     if upscale_factor is not None:
+    #         select_cmd = (
+    #             f"[0:v]scale=iw*{upscale_factor}:ih*{upscale_factor}:flags=neighbor"
+    #             "[upscaled];[upscaled]"
+    #         )
+
+    #     # Build output mapping (must match contiguous indices)
+    #     map_cmds = "".join(
+    #         f' -map "[out{idx}]" -q:v 2 "{downscale_dirs[idx] / f"{framename}{copied_image_paths[0].suffix}"}"'
+    #         for idx in range(num_levels)
+    #     )
+
+    #     ffmpeg_cmd += f' -filter_complex "{select_cmd}{crop_cmd}{downscale_chain}"{map_cmds}'
+
+    #     if verbose:
+    #         CONSOLE.log(f"... {ffmpeg_cmd}")
+
+    #     run_command(ffmpeg_cmd, verbose=verbose)
 
     if num_frames == 0:
         CONSOLE.log("[bold red]:skull: No usable images in the data folder.")

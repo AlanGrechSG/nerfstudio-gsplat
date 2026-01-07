@@ -354,6 +354,10 @@ class ProcessRealityCapture(BaseConverterToNerfstudioDataset, _NoDefaultProcessR
     ply: Optional[Path] = None
     """Path to the RealityCapture exported ply file"""
 
+    start_downscales: int = 0
+    """Number of times to downscale the images before processing. Downscales by 2 each time. For example a value of 2
+        will downscale the images by 4x before processing. This is useful if the original images are very large."""
+
     num_downscales: int = 3
     """Number of times to downscale the images. Downscales by 2 each time. For example a value of 3
         will downscale the images by 2x, 4x, and 8x."""
@@ -390,6 +394,7 @@ class ProcessRealityCapture(BaseConverterToNerfstudioDataset, _NoDefaultProcessR
             image_dir=image_dir,
             verbose=self.verbose,
             num_downscales=self.num_downscales,
+            start_downscales=self.start_downscales,
         )
         num_frames = len(copied_image_paths)
 

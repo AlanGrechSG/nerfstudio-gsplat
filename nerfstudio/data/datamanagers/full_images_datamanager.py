@@ -237,7 +237,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             return data
 
         CONSOLE.log(f"Caching / undistorting {split} images")
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             undistorted_images = list(
                 track(
                     executor.map(

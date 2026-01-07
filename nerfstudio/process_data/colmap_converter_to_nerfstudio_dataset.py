@@ -15,6 +15,7 @@
 """Base class to processes a video or image sequence to a nerfstudio compatible dataset."""
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -104,6 +105,8 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     use_single_camera_mode: bool = True
     """Whether to assume all images taken with the same camera characteristics, set to False for multiple cameras in colmap (only works with hloc sfm_tool).
     """
+    max_image_size: int = 3200
+    """The maximum image size that colmap uses."""
 
     @staticmethod
     def default_colmap_path() -> Path:
@@ -132,6 +135,10 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
         """
         summary_log = []
         if (self.absolute_colmap_model_path / "cameras.bin").exists():
+            if image_rename_map:
+                with open(self.output_dir / "original_to_ns.json", "w", encoding="utf-8") as f:
+                    json.dump(image_rename_map, f, indent=4)
+
             with CONSOLE.status("[bold yellow]Saving results to transforms.json", spinner="balloon"):
                 num_matched_frames = colmap_utils.colmap_to_json(
                     recon_dir=self.absolute_colmap_model_path,
@@ -219,6 +226,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 matching_method=self.matching_method,
                 refine_intrinsics=self.refine_intrinsics,
                 colmap_cmd=self.colmap_cmd,
+                max_image_size=self.max_image_size
             )
         elif sfm_tool == "hloc":
             if mask_path is not None:
