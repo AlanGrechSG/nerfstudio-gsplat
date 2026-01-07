@@ -7,6 +7,7 @@ import plyfile
 import torch
 from tqdm import tqdm
 import open3d as o3d
+import argparse
 
 def load_camera_intrinsics(transform_file: Path, device: torch.device = torch.device("cpu")):
     transform_json = json.loads(transform_file.read_text())
@@ -130,7 +131,7 @@ def main():
 
     # retrain_all(data_dir, processed_folder)
 
-def retrain_all(data_dir: Path, processed_folder: str = "processed"):
+def retrain_all(data_dir: Path, splat_ply: Path, processed_folder: str = "processed"):
     retrain_all_cmd = [
         "ns-train", "splatfacto",
         "--data", processed_folder,
@@ -138,6 +139,7 @@ def retrain_all(data_dir: Path, processed_folder: str = "processed"):
         "--viewer.quit-on-train-completion", "True",
         "--mixed-precision", "True",
         "--pipeline.datamanager.cache-images", "cpu",
+        "--pipeline.model.gaussian-init-ply", str(data_dir / splat_ply),
         "nerfstudio-data",
         "--downscale-factor", "4"
     ]
@@ -167,9 +169,8 @@ def view_splatcloud():
     o3d.visualization.draw_geometries([pcd])
 
 if __name__ == "__main__":
-    # main()
-    if platform.system() == "Linux":
-        data_dir = Path("/mnt/d/full-cathedral")
-    else:
-        data_dir = Path("D:\\full-cathedral")
-    retrain_all(data_dir)
+    parser = argparse.ArgumentParser(description="Combine splat point clouds and retrain.")
+    parser.add_argument("--data", required=True, help="The path to the base data directory.")
+    parser.add_argument("--splat_ply", required=True, help="The path to the combined splat PLY file relative to the base data directory.")
+    args = parser.parse_args()
+    retrain_all(Path(args.data), Path(args.splat_ply))
